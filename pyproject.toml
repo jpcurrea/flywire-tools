@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flywire-tools"
+version = "2024.10.15.01"
+authors = [
+  { name="John Paul Currea", email="johnpaulcurrea@gmail.com" },
+]
+description = "A collection of tools for interfacing with the Flywire connectome"
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+  "navis[all]",
+  "matplotlib",
+  "networkx",
+  "numpy",
+  "pandas",
+  "scipy",  
+  "seaborn",  
+  "svgutils"
+]
+
+[project.urls]
+Homepage = "https://github.com/jpcurrea/flywire-tools"
