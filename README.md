@@ -40,14 +40,4 @@ pip install .
 
 ## [Flywire through Navis: the basics](docs/startup.ipynb)
 
-## Documentation
-### Connectome object
-#### look-up IDs
-#### get_paths
-#### get_connectivity
-#### connectivity_panel
-#### get_downstream_convergence
-### Paths object
-#### monte_carlo
-
-## Examples (ipython notebook embedded as markdown, with link to Binder)
+## [Documentation](docs/api_tutorial.ipynb)

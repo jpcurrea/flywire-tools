@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flywire-tools"
-version = "2024.10.15.02"
+version = "2024.10.16.01"
 authors = [
   { name="John Paul Currea", email="johnpaulcurrea@gmail.com" },
 ]
