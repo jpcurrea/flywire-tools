@@ -1,5 +1,5 @@
 # flywire-tools
-![flywire's 50 largest cells](./docs/fw_50_L.png)
+![flywire's 50 largest cells](docs/fw_50_L.png)
 
 ## You _really_ should use the connectome.
 
