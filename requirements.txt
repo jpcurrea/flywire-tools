@@ -1,0 +1,8 @@
+navis[all]
+matplotlib
+networkx
+numpy
+pandas
+scipy
+seaborn
+svgutils
