@@ -12,6 +12,7 @@ import numpy as np
 import os
 import pandas as pd
 import pickle
+# import pylustrator
 import scipy
 import seaborn as sbn
 import shutil
@@ -137,7 +138,7 @@ class Connectome():
         return paths
 
 
-    def get_downstream_convergence(self, group_a, group_b, simulation_use_inits, sim_reps=1e5, **path_kwargs):
+    def get_downstream_convergence(self, group_a, group_b, simulation_use_inits=True, sim_reps=1e5, **path_kwargs):
         """Find all paths downstream of group_a and group_b and compare.
 
         Parameters
@@ -465,9 +466,9 @@ class Connectome():
         missing_post = np.setdiff1d(other_path.root_ids, pivot[stop_col].unique())
         # add the missing cells
         for missing_id in missing_pre:
-            pivot = pivot.append({start_col: missing_id, stop_col: -1, 'weight': 0}, ignore_index=True)
+            pivot = pd.concat([pivot, pd.DataFrame([{start_col: missing_id, stop_col: -1, 'weight': 0}])], ignore_index=True)
         for missing_id in missing_post:
-            pivot = pivot.append({start_col: -1, stop_col: missing_id, 'weight': 0}, ignore_index=True)
+            pivot = pd.concat([pivot, pd.DataFrame([{start_col: -1, stop_col: missing_id, 'weight': 0}])], ignore_index=True)
         edges_pivot = pivot.pivot(index=start_col, columns=stop_col, values='weight')
         # replace NaNs with 0s
         edges_pivot.fillna(0, inplace=True)
@@ -575,8 +576,12 @@ class Connectome():
                 missing_pre = np.setdiff1d(main_path.root_ids, pivot[start_col].unique())
                 missing_post = np.setdiff1d(other_path.root_ids, pivot[stop_col].unique())
                 # add the missing cells
-                for missing_id in missing_pre: pivot = pivot.append({start_col: missing_id, stop_col: -1, 'weight': 0}, ignore_index=True)
-                for missing_id in missing_post: pivot = pivot.append({start_col: -1, stop_col: missing_id, 'weight': 0}, ignore_index=True)
+                for missing_id in missing_pre: 
+                    # pivot = pivot.append({start_col: missing_id, stop_col: -1, 'weight': 0}, ignore_index=True)
+                    pivot = pd.concat([pivot, pd.DataFrame([{start_col: missing_id, stop_col: -1, 'weight': 0}])], ignore_index=True)
+                for missing_id in missing_post: 
+                    # pivot = pivot.append({start_col: -1, stop_col: missing_id, 'weight': 0}, ignore_index=True)
+                    pivot = pd.concat([pivot, pd.DataFrame([{start_col: -1, stop_col: missing_id, 'weight': 0}])], ignore_index=True)
                 edges_pivot = pivot.pivot(index=start_col, columns=stop_col, values='weight')
                 # replace NaNs with 0s
                 edges_pivot.fillna(0, inplace=True)
