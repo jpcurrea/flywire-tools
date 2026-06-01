@@ -1,8 +1,8 @@
-navis[all]
+fafbseg
 matplotlib
+navis[all]
 networkx
 numpy
 pandas
 scipy
 seaborn
-svgutils
