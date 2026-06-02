@@ -184,7 +184,19 @@ class Connectome():
         # for each group, get the downstream pathways up to max_hops
         paths = {}
         for lbl, root_ids in zip([group_a, group_b], [group_a_ids, group_b_ids]):
-            paths[lbl] = self.get_paths(root_ids, downstream=True, **path_kwargs)
+            local_path_kwargs = dict(path_kwargs)
+            if 'direction' in local_path_kwargs:
+                local_path_kwargs.pop('downstream', None)
+                local_path_kwargs.pop('upstream', None)
+            else:
+                if local_path_kwargs.pop('upstream', False):
+                    local_path_kwargs['direction'] = 'upstream'
+                elif 'downstream' in local_path_kwargs:
+                    is_downstream = local_path_kwargs.pop('downstream')
+                    local_path_kwargs['direction'] = 'downstream' if is_downstream else 'upstream'
+                else:
+                    local_path_kwargs['direction'] = 'downstream'
+            paths[lbl] = self.get_paths(root_ids, **local_path_kwargs)
             print(f"Found {len(paths[lbl].node_ids)} nodes and {len(paths[lbl].edges_df)} edges for {lbl}.")
         # get the intersection of root IDs at each combination of stages
         max_level = int(max([path.node_info.level.max() for path in paths.values()]))
@@ -449,7 +461,7 @@ class Connectome():
                 paths[group] = self.past_paths[group]
             else:
                 root_ids = self.lookup_root_ids(group)
-                path = self.get_paths(root_ids, downstream=True, upstream=False, max_hops=1, skip_recurrents=False)
+                path = self.get_paths(root_ids, direction='downstream', max_hops=1, skip_recurrents=False)
                 path.root_ids = root_ids
                 print(f"Found {len(path.node_ids)} nodes and {len(path.edges_df)} edges for {group}.")
                 self.past_paths[group] = path
