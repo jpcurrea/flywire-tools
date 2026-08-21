@@ -1,0 +1,12 @@
+# large data files (too big for GitHub)
+connections_no_threshold.csv
+
+# cached field arrays
+fields_ds/
+fields_ds_sensitivity_left/
+fields_ds_left/
+*.npz
+
+# generated figures
+*.png
+*.html

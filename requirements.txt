@@ -1,8 +1,11 @@
 fafbseg
+h5py
 matplotlib
 navis[all]
 networkx
 numpy
 pandas
+plotly
 scipy
 seaborn
+svgutils

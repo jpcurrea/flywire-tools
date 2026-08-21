@@ -82,7 +82,7 @@ class Connectome():
                 time.sleep(5)
         return flywire.search_annotations(cell_type, materialization=783).root_id.values.tolist()
 
-    def get_paths(self, source, max_hops=5, direction='downstream', skip_recurrents=True, rerun=False):
+    def get_paths(self, source, max_hops=5, direction='downstream', skip_recurrents=False, rerun=False):
         """Find all pathways downstream of root_ids up to max_hops.
 
         Option to search for upstream or downstream connections.
@@ -96,7 +96,7 @@ class Connectome():
             The maximum number of hops to search downstream. Default is 5.
         direction : str, default='downstream'
             Whether to search for downstream or upstream.
-        skip_recurrents : bool, default=True
+        skip_recurrents : bool, default=False
             Whether to avoid hopping towards cells that have already been included.
 
         Returns
@@ -1421,6 +1421,127 @@ class Paths():
         self.monte_carlo_node_ids = mc_grp['node_ids']
         return all_nodes, paths_ds
 
+    def monte_carlo_matrix(self, reps=1e5, direction='downstream', save_fn=None, seed=None):
+        """Matrix-based Monte Carlo — faster drop-in replacement for monte_carlo().
+
+        Produces the same ``paths_ds`` output as ``monte_carlo()`` (HDF5 dataset
+        of shape ``(S, H, R)``) and is compatible with all downstream methods
+        (``get_simulation_info``, ``get_pathways``, ``get_pathway_information``,
+        ``get_synaptic_fields``).
+
+        Speedup over ``monte_carlo()``:
+
+        1. The CSR transition matrix is built once; cumulative row probabilities
+           are pre-computed and reused every hop rather than looked up per node
+           from the NetworkX dict.
+        2. All ``S * R`` walkers at each unique node are sampled in a single
+           ``np.searchsorted`` call (vectorized inverse-CDF), replacing the
+           Python-level ``np.random.choice`` loop in the NetworkX backend.
+
+        Parameters
+        ----------
+        reps : int, default=1e5
+            Number of random-walk replicates per starting cell.
+        direction : str, default='downstream'
+            ``'downstream'`` (pre→post) or ``'upstream'`` (post→pre).
+        save_fn : str, optional
+            HDF5 output path.  If omitted a temporary file is used (same as
+            ``monte_carlo()``).
+        seed : int or None
+            Random seed for reproducibility.
+
+        Returns
+        -------
+        all_nodes : ndarray
+            Sorted node IDs (matrix index → root_id mapping).
+        paths_ds : h5py.Dataset
+            Shape ``(S, H, R)``, integer node indices; identical format to the
+            dataset produced by ``monte_carlo()``.
+        """
+        rng = np.random.default_rng(seed)
+
+        # --- setup mirrors monte_carlo() ---
+        all_nodes = self.node_info.root_id.values
+        initial_nodes = self.node_info[self.node_info.level == 0]
+        max_level = self.node_info.level.max()
+        min_level = self.node_info.level.min()
+        if direction == 'downstream':
+            levels = np.arange(max_level + 1)
+        elif direction == 'upstream':
+            levels = np.arange(min_level, 1)[::-1]
+        else:
+            raise ValueError("direction must be 'downstream' or 'upstream'")
+
+        reps = int(reps)
+        num_starting = len(initial_nodes)
+        shape = (num_starting, len(levels), reps)
+
+        # --- HDF5 storage (mirrors monte_carlo()) ---
+        print("Setting up HDF5 storage for matrix simulation...")
+        if save_fn is not None:
+            if self._h5file is not None and getattr(self._h5file, 'filename', None) != save_fn:
+                try:
+                    self._h5file.close()
+                except Exception:
+                    pass
+                self._h5file = None
+            self._temp_h5_path = save_fn
+            self._h5file = h5py.File(self._temp_h5_path, 'a')
+            self._saved = True
+        else:
+            if self._h5file is not None:
+                try:
+                    self._temp_h5_path = self._h5file.filename
+                except Exception:
+                    self._h5file = None
+            if self._h5file is None:
+                if self._temp_h5_path is None:
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.h5')
+                    self._temp_h5_path = tmp.name
+                    tmp.close()
+                self._h5file = h5py.File(self._temp_h5_path, 'a')
+
+        mc_grp = self._h5file.require_group('monte_carlo')
+        print("Creating paths dataset...")
+        paths_ds = mc_grp.require_dataset(
+            'paths', shape=shape, dtype='int64',
+            chunks=(1, shape[1], shape[2]), compression=None, fillvalue=-1, exact=True)
+
+        # --- build transition matrix once, extract raw CSR arrays ---
+        import scipy.sparse as sp
+        P = self._build_transition_matrix()   # row-stochastic CSR (N, N)
+        indptr  = P.indptr
+        nb_idx  = P.indices
+        nb_data = P.data
+        rowsum  = np.asarray(P.sum(axis=1)).ravel()
+
+        init_idx = np.searchsorted(all_nodes, initial_nodes.root_id.values)  # (S,)
+
+        print("Starting matrix Monte Carlo simulation...")
+        for s, (start_idx, chunk_idx) in enumerate(
+                zip(init_idx, paths_ds.iter_chunks())):
+            current = np.full(reps, start_idx, dtype=np.int64)
+            chunk = np.full((1, len(levels), reps), -1, dtype=np.int64)
+            chunk[0, 0, :] = current
+
+            for level_ind in range(1, len(levels)):
+                nxt, surv = Paths._csr_sample_step(
+                    indptr, nb_idx, nb_data, rowsum, current, rng)
+                # dead / leaked walkers get fill value -1, matching NetworkX backend
+                current = np.where(surv, nxt, -1)
+                chunk[0, level_ind, :] = current
+
+            paths_ds[chunk_idx] = chunk
+            print_progress(s + 1, num_starting,
+                           prefix='Matrix MC:', suffix='Complete', bar_length=40)
+
+        all_nodes = np.append(all_nodes, np.nan)
+        mc_grp.require_dataset('node_ids', data=all_nodes,
+                               shape=all_nodes.shape, dtype='int', exact=True)
+        self.monte_carlo_paths    = paths_ds
+        self.monte_carlo_node_ids = mc_grp['node_ids']
+        return all_nodes, paths_ds
+
     def get_simulation_info(self, chunk_size=1000):
         """Get supplementary info about the monte carlo simulation to help with pathway analysis, using chunked access."""
         import numpy as np
@@ -1920,7 +2041,7 @@ class Paths():
         self.pathways_info = pathways_info
         return pathway_set, pathways_info
     
-    def get_synaptic_fields(self, stopping_points=['L1', 'L2', 'L3', 'L4', 'L5', 'R7', 'R8'], side='right', conditional=False):
+    def get_synaptic_fields(self, stopping_points=['L1', 'L2', 'L3', 'L4', 'L5', 'R7', 'R8'], side='right', conditional=False, method='simulation', num_hops=None, column_file='column_assignment.csv', normalize=True):
         """Get all receptive fields for the target.
 
         Note: if you want to subset the pathways or apply specific stopping points,
@@ -1935,6 +2056,24 @@ class Paths():
         conditional : bool, default=False
             If True, compute probabilities conditional on the subset provided to get_pathways()
             or the top_pathways.
+        method : str, default='simulation'
+            The backend used to compute the fields. 'simulation' uses the Monte Carlo
+            results (requires get_pathways()/get_pathway_information() to have been run).
+            'analytic' computes the same marginal first-passage probabilities exactly by
+            propagating the transition matrix, without needing a Monte Carlo run.
+            'matrix_mc' estimates the same quantities by sampling walkers through the
+            transition matrix (vectorized inverse-CDF); pass ``reps`` to control accuracy.
+        num_hops : int, optional
+            Only used when method='analytic'. Number of propagation hops. Defaults to the
+            maximum absolute level in node_info (i.e. the graph depth).
+        normalize : bool, default=True
+            If True (default), the transition matrix is row-stochastic and output values
+            are probabilities (each node distributes exactly 1 unit of mass). If False,
+            raw synapse weights are used without row-normalization, so output values
+            represent total synapse-weighted flow — nodes with many outgoing synapses
+            contribute proportionally more, revealing absolute connectivity strength.
+            For method='matrix_mc', False keeps raw walker-hit counts instead of
+            dividing by reps.
 
         Returns
         -------
@@ -1953,8 +2092,18 @@ class Paths():
             The same procedure for a downstream projection will represent the amount of downstream
             mixing, characterized best by the 2D impulse response (akin to a point spread function).
         """
+        # dispatch to the analytic backend if requested
+        if method == 'analytic':
+            return self._get_synaptic_fields_analytic(
+                stopping_points=stopping_points, side=side,
+                conditional=conditional, num_hops=num_hops, normalize=normalize)
+        elif method == 'matrix_mc':
+            return self._get_synaptic_fields_matrix_mc(
+                stopping_points=stopping_points, side=side,
+                conditional=conditional, num_hops=num_hops, normalize=normalize)
+        elif method != 'simulation':
+            raise ValueError("method must be 'simulation', 'analytic', or 'matrix_mc'")
         # TODO: implement side logic properly -- right now both sides are being combined
-        breakpoint()
 
         if self.direction == 'upstream':
             sep = ' < '
@@ -1977,18 +2126,18 @@ class Paths():
         #     input_included |= np.char.find(pathways, cell_type) != -1
         # input_included = self.subset_mask
         # download the visual column assignment file if not already present
-        if not os.path.exists("column_assignment.csv"):
+        if not os.path.exists(column_file):
             import urllib
             # download and unzip the file from flywire
             url = "https://storage.googleapis.com/flywire-data/codex/data/fafb/783/column_assignment.csv.gz"
             urllib.request.urlretrieve(url, "column_assignment.csv.gz")
             import gzip
-            output_file_path = 'column_assignment.csv'
+            output_file_path = column_file
             with gzip.open("column_assignment.csv.gz", 'rb') as f_in:
                 with open(output_file_path, 'wb') as f_out:
                     shutil.copyfileobj(f_in, f_out)
         # load the visual column data
-        visual_column_info = pd.read_csv("column_assignment.csv", index_col=0)
+        visual_column_info = pd.read_csv(column_file, index_col=0)
         # grab the retinal coordinates
         all_ps, all_qs = visual_column_info[['p', 'q']].values.T
         # get the coordinate bounds
@@ -2213,6 +2362,455 @@ class Paths():
             return self.synaptic_fields, self.synaptic_sub_pathways
         return self.synaptic_fields, self.synaptic_effects
 
+    def _build_transition_matrix(self, normalize=True):
+        """Build a sparse transition matrix matching the walk direction.
+
+        Parameters
+        ----------
+        normalize : bool, default=True
+            If True, each row is divided by its sum so that the matrix is row-stochastic
+            (probability interpretation). If False, raw synapse weights are preserved.
+
+        Returns
+        -------
+        P : scipy.sparse.csr_matrix, shape (N, N)
+            P[i, j] is the (optionally normalized) edge weight from node index i to j,
+            where node indices are positions in the sorted ``self.node_ids``. Weights
+            are taken from the graph edge 'weight' attribute. When normalize=True each
+            row sums to ≤ 1 (rows for dead-end nodes sum to 0). When normalize=False
+            each row sums to the total outgoing synapse count for that node.
+            Downstream walks move pre -> post; upstream walks move post -> pre.
+        """
+        import scipy.sparse as sp
+        node_ids = self.node_ids
+        N = len(node_ids)
+        # gather weighted edges from the graph (u -> v with weight w)
+        us, vs, ws = [], [], []
+        for u, v, w in self.graph.edges(data='weight'):
+            us.append(u)
+            vs.append(v)
+            ws.append(1.0 if w is None else float(w))
+        if len(us) == 0:
+            return sp.csr_matrix((N, N), dtype=float)
+        us = np.asarray(us)
+        vs = np.asarray(vs)
+        ws = np.asarray(ws, dtype=float)
+        u_idx = np.searchsorted(node_ids, us)
+        v_idx = np.searchsorted(node_ids, vs)
+        # a walker moves along the direction of the walk (downstream: pre->post, upstream: post->pre)
+        if self.direction == 'downstream':
+            rows, cols = u_idx, v_idx
+        else:
+            rows, cols = v_idx, u_idx
+        # duplicate (row, col) entries are summed by csr_matrix, matching aggregated weights
+        P = sp.csr_matrix((ws, (rows, cols)), shape=(N, N))
+        if normalize:
+            # row-normalize so each row is a probability distribution
+            row_sums = np.asarray(P.sum(axis=1)).ravel()
+            inv = np.zeros_like(row_sums)
+            nonzero = row_sums > 0
+            inv[nonzero] = 1.0 / row_sums[nonzero]
+            P = sp.diags(inv) @ P
+        return P.tocsr()
+
+    def _get_synaptic_fields_analytic(self, stopping_points=['L1', 'L2', 'L3', 'L4', 'L5', 'R7', 'R8'],
+                                      side='right', conditional=False, num_hops=None, normalize=True):
+        """Analytic synaptic fields via first-passage propagation of the transition matrix.
+
+        Computes the same marginal quantity the simulation estimates by counting -- the
+        probability that a walk from each target (level-0) cell first reaches an input cell
+        of a given type at retinal coordinate (p, q) -- but exactly and without a Monte
+        Carlo run. Does not require get_pathways()/monte_carlo() to have been called.
+
+        Parameters
+        ----------
+        stopping_points : list of str
+            Cell types treated as absorbing input layers (a walk stops at first arrival).
+        side : str, default='right'
+            The eye side ('left' or 'right') whose columns provide retinal coordinates.
+        conditional : bool, default=False
+            If True, normalize each target's field by its total mass reaching any stopping
+            point (distribution over origins given the input layer was reached). If False,
+            fields are absolute first-passage probabilities (or raw synapse-weighted totals
+            when normalize=False).
+        num_hops : int, optional
+            Number of propagation hops. Defaults to the maximum absolute level in node_info
+            (the graph depth).
+        normalize : bool, default=True
+            If True, the transition matrix is row-stochastic and output values are
+            probabilities. If False, raw synapse weights are used without row-normalization;
+            output values represent total synapse-weighted flow to each stopping-point cell,
+            preserving differences in absolute connectivity strength across ommatidia.
+
+        Returns
+        -------
+        synaptic_fields : SynapticFields
+            One SynapticField (shape (num_targets, width, height)) per stopping-point type,
+            plus an 'all' entry summing across types.
+        effects : dict
+            Placeholder neurotransmitter effect per field (1.0); analytic mode does not
+            compute the trajectory-dependent transmitter signs that the simulation does.
+        """
+        import scipy.sparse as sp
+        # ensure the visual column assignment file is available
+        if not os.path.exists("column_assignment.csv"):
+            import urllib.request
+            url = "https://storage.googleapis.com/flywire-data/codex/data/fafb/783/column_assignment.csv.gz"
+            urllib.request.urlretrieve(url, "column_assignment.csv.gz")
+            with gzip.open("column_assignment.csv.gz", 'rb') as f_in:
+                with open('column_assignment.csv', 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+        visual_column_info = pd.read_csv("column_assignment.csv", index_col=0)
+        # retinal-coordinate grid bounds (shared with the simulation backend)
+        all_ps, all_qs = visual_column_info[['p', 'q']].values.T
+        pmin, pmax = int(all_ps.min()), int(all_ps.max()) + 1
+        qmin, qmax = int(all_qs.min()), int(all_qs.max()) + 1
+        width, height = pmax - pmin, qmax - qmin
+        pvals, qvals = np.meshgrid(np.arange(pmin, pmax), np.arange(qmin, qmax), indexing='ij')
+        # sorted node ids and the row-stochastic transition matrix
+        node_ids = self.node_ids
+        N = len(node_ids)
+        P = self._build_transition_matrix(normalize=normalize)
+        # target (level-0) cells form the first axis of each field
+        initial = self.node_info[self.node_info.level == 0]
+        target_ids = initial.root_id.values
+        assert len(target_ids) > 0, "No level-0 (target) cells found in node_info."
+        target_idx = np.searchsorted(node_ids, target_ids)
+        num_targets = len(target_idx)
+        # number of hops defaults to the graph depth
+        if num_hops is None:
+            num_hops = int(np.abs(self.node_info.level.values).max())
+        num_hops = max(int(num_hops), 1)
+        # collect stopping cells and their retinal coordinates per type
+        stopping_points = np.asarray(stopping_points)
+        types_col = visual_column_info['type']
+        hemi_col = visual_column_info['hemisphere']
+        type_cells = {}
+        absorbing_list = []
+        for cell_type in stopping_points:
+            sel = visual_column_info[(types_col == cell_type) & (hemi_col == side)]
+            if len(sel) == 0:
+                continue
+            in_graph = np.isin(sel.index.values, node_ids)
+            sel = sel[in_graph]
+            if len(sel) == 0:
+                continue
+            idx = np.searchsorted(node_ids, sel.index.values)
+            ps = sel['p'].values.astype(int)
+            qs = sel['q'].values.astype(int)
+            type_cells[cell_type] = (idx, ps, qs)
+            absorbing_list.append(idx)
+        assert len(absorbing_list) > 0, (
+            f"None of the stopping points {list(stopping_points)} were found on the "
+            f"'{side}' side within this Paths graph.")
+        absorbing_idx = np.unique(np.concatenate(absorbing_list))
+        is_absorbing = np.zeros(N, dtype=bool)
+        is_absorbing[absorbing_idx] = True
+        # zero the outgoing rows of absorbing nodes so mass stops on first arrival
+        P_eff = (sp.diags((~is_absorbing).astype(float)) @ P).tocsr()
+        # start one unit of mass at each target and propagate, accumulating absorbed mass
+        dist = sp.csr_matrix((np.ones(num_targets), (np.arange(num_targets), target_idx)),
+                             shape=(num_targets, N))
+        absorbed = np.zeros((num_targets, N), dtype=np.float64)
+        for hop in range(num_hops):
+            absorbed[:, absorbing_idx] += dist[:, absorbing_idx].toarray()
+            dist = dist @ P_eff
+            print_progress(hop + 1, num_hops, prefix="Analytic synaptic fields:", suffix="Complete")
+        # capture mass that arrives on the final hop
+        absorbed[:, absorbing_idx] += dist[:, absorbing_idx].toarray()
+        # optional conditioning on reaching any stopping point
+        if conditional:
+            denom = absorbed[:, absorbing_idx].sum(axis=1)
+            denom[denom == 0] = 1.0
+        else:
+            denom = np.ones(num_targets)
+        # build a grid per type and the aggregate 'all'
+        fields = {}
+        all_grid = np.zeros((num_targets, width, height), dtype=np.float32)
+        for cell_type, (idx, ps, qs) in type_cells.items():
+            grid = np.zeros((num_targets, width, height), dtype=np.float32)
+            # when normalize=False, denom is already ones and absorbed holds raw
+            # synapse-weighted flow, so no further division is applied here
+            mass = absorbed[:, idx] / denom[:, None]
+            for col in range(len(idx)):
+                grid[:, ps[col] - pmin, qs[col] - qmin] += mass[:, col]
+            fields[cell_type] = SynapticField(grid, ps=pvals, qs=qvals)
+            all_grid += grid
+        fields['all'] = SynapticField(all_grid, ps=pvals, qs=qvals)
+        effects = {key: 1.0 for key in fields.keys()}
+        self.synaptic_fields = SynapticFields(fields)
+        self.synaptic_effects = effects
+        return self.synaptic_fields, self.synaptic_effects
+
+    # ------------------------------------------------------------------
+    # Vectorized helper: one matrix-MC hop for many walkers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _csr_sample_step(indptr, indices, data, rowsum, walker_idx, rng):
+        """Sample one hop for W walkers from a CSR transition matrix.
+
+        Parameters
+        ----------
+        indptr, indices, data : CSR arrays of the row-stochastic matrix P (or P_eff).
+        rowsum : (N,) array of per-row probability sums (< 1 for leaky rows).
+        walker_idx : (W,) int64 array of current node positions (-1 = dead).
+        rng : np.random.Generator
+
+        Returns
+        -------
+        next_idx : (W,) int64 — next node indices; -1 for dead/dead-end walkers.
+        survived : (W,) bool — False for walkers that leaked out or were already dead.
+        """
+        W = len(walker_idx)
+        next_idx = np.full(W, -1, dtype=np.int64)
+        survived = np.zeros(W, dtype=bool)
+
+        alive = walker_idx >= 0
+        if not alive.any():
+            return next_idx, survived
+
+        active = np.where(alive)[0]
+        cur = walker_idx[active]
+
+        # Leakage: walkers die with probability 1 - rowsum[cur]
+        u = rng.random(len(active))
+        alive_after_leak = u < rowsum[cur]
+        if not alive_after_leak.any():
+            return next_idx, survived
+
+        act2 = active[alive_after_leak]
+        cur2 = cur[alive_after_leak]
+        u2 = u[alive_after_leak]        # reuse the same draw, rescaled into [0, rowsum]
+
+        # Group by current node for batch inverse-CDF sampling
+        order = np.argsort(cur2, kind='stable')
+        cur2_o = cur2[order]
+        u2_o = u2[order]
+        uniq, ustarts = np.unique(cur2_o, return_index=True)
+        ustarts = np.append(ustarts, cur2_o.size)
+
+        nxt = np.empty(cur2_o.size, dtype=np.int64)
+        for ki in range(len(uniq)):
+            node = uniq[ki]
+            lo, hi = ustarts[ki], ustarts[ki + 1]
+            a, b = int(indptr[node]), int(indptr[node + 1])
+            if a == b:          # dead-end
+                nxt[lo:hi] = -1
+                continue
+            row_probs = data[a:b]
+            cumprobs = np.cumsum(row_probs)
+            cumprobs[-1] = rowsum[node]   # guard against float rounding
+            jj = np.searchsorted(cumprobs, u2_o[lo:hi], side='right')
+            jj = np.clip(jj, 0, b - a - 1)
+            nxt[lo:hi] = indices[a + jj]
+
+        inv_order = np.argsort(order, kind='stable')
+        nxt = nxt[inv_order]
+
+        valid = nxt >= 0
+        next_idx[act2[valid]] = nxt[valid]
+        survived[act2[valid]] = True
+        return next_idx, survived
+
+    def _get_synaptic_fields_matrix_mc(self,
+                                       stopping_points=None,
+                                       side='right',
+                                       conditional=False,
+                                       num_hops=None,
+                                       reps=5000,
+                                       seed=None,
+                                       normalize=True):
+        """Matrix-based Monte Carlo synaptic fields.
+
+        Estimates the same first-passage probabilities as
+        ``_get_synaptic_fields_analytic`` but by sampling: each target cell
+        launches ``reps`` walkers which step according to the row-stochastic
+        transition matrix until they are absorbed by a stopping-point cell or
+        exhaust ``num_hops`` steps.  Sampling is vectorized across all walkers
+        at each hop via inverse-CDF on pre-sorted CSR rows.
+
+        Parameters
+        ----------
+        stopping_points : list of str, optional
+            Cell types treated as absorbing input layers.  Defaults to
+            ``['L1', 'L2', 'L3', 'L4', 'L5', 'R7', 'R8']``.
+        side : str, default='right'
+            Eye hemisphere whose column coordinates are used.
+        conditional : bool, default=False
+            If True, normalize each target's field by its total absorbed mass.
+        num_hops : int, optional
+            Propagation depth; defaults to the graph depth in ``node_info``.
+        reps : int, default=5000
+            Number of Monte Carlo walkers launched per target cell.
+        seed : int or None
+            Random seed for reproducibility.
+        normalize : bool, default=True
+            If True, output values are probabilities (counts / reps, or counts /
+            total absorbed when conditional=True). If False, output values are raw
+            walker-hit counts (integers as float32), preserving absolute differences
+            in how many paths reach each ommatidium.
+
+        Returns
+        -------
+        synaptic_fields : SynapticFields
+        effects : dict
+        """
+        import scipy.sparse as sp
+
+        if stopping_points is None:
+            stopping_points = ['L1', 'L2', 'L3', 'L4', 'L5', 'R7', 'R8']
+
+        rng = np.random.default_rng(seed)
+
+        # --- retinal grid setup (shared with the analytic backend) ---
+        if not os.path.exists("column_assignment.csv"):
+            import urllib.request
+            url = ("https://storage.googleapis.com/flywire-data/codex/data/"
+                   "fafb/783/column_assignment.csv.gz")
+            urllib.request.urlretrieve(url, "column_assignment.csv.gz")
+            with gzip.open("column_assignment.csv.gz", 'rb') as f_in:
+                with open('column_assignment.csv', 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+        visual_column_info = pd.read_csv("column_assignment.csv", index_col=0)
+        all_ps, all_qs = visual_column_info[['p', 'q']].values.T
+        pmin, pmax = int(all_ps.min()), int(all_ps.max()) + 1
+        qmin, qmax = int(all_qs.min()), int(all_qs.max()) + 1
+        width, height = pmax - pmin, qmax - qmin
+        pvals, qvals = np.meshgrid(np.arange(pmin, pmax),
+                                   np.arange(qmin, qmax), indexing='ij')
+
+        # --- transition matrix and absorbing nodes ---
+        node_ids = self.node_ids
+        N = len(node_ids)
+        P = self._build_transition_matrix()          # row-stochastic CSR
+
+        stopping_points = np.asarray(stopping_points)
+        types_col = visual_column_info['type']
+        hemi_col  = visual_column_info['hemisphere']
+        type_cells = {}
+        absorbing_list = []
+        for cell_type in stopping_points:
+            sel = visual_column_info[(types_col == cell_type) & (hemi_col == side)]
+            if len(sel) == 0:
+                continue
+            in_graph = np.isin(sel.index.values, node_ids)
+            sel = sel[in_graph]
+            if len(sel) == 0:
+                continue
+            idx = np.searchsorted(node_ids, sel.index.values)
+            ps  = sel['p'].values.astype(int)
+            qs  = sel['q'].values.astype(int)
+            type_cells[cell_type] = (idx, ps, qs)
+            absorbing_list.append(idx)
+
+        assert len(absorbing_list) > 0, (
+            f"None of the stopping points {list(stopping_points)} were found on "
+            f"the '{side}' side within this Paths graph.")
+
+        absorbing_idx = np.unique(np.concatenate(absorbing_list))
+        is_absorbing  = np.zeros(N, dtype=bool)
+        is_absorbing[absorbing_idx] = True
+
+        # P_eff: zero outgoing edges of absorbing nodes so walkers stop on arrival
+        P_eff = (sp.diags((~is_absorbing).astype(float)) @ P).tocsr()
+        indptr   = P_eff.indptr
+        nb_idx   = P_eff.indices
+        nb_data  = P_eff.data
+        rowsum   = np.asarray(P_eff.sum(axis=1)).ravel()   # 0 at absorbing rows
+
+        # Provide a rowsum of 1 for absorbing rows so the leak check fires
+        # immediately (walker is already absorbed; the step function never
+        # reaches sampling for those nodes anyway, but this keeps the logic clean).
+        rowsum_eff = rowsum.copy()
+        rowsum_eff[absorbing_idx] = 1.0   # treated specially below
+
+        # --- target (level-0) cells ---
+        initial     = self.node_info[self.node_info.level == 0]
+        target_ids  = initial.root_id.values
+        assert len(target_ids) > 0, "No level-0 (target) cells found in node_info."
+        target_idx  = np.searchsorted(node_ids, target_ids)
+        num_targets = len(target_idx)
+
+        if num_hops is None:
+            num_hops = int(np.abs(self.node_info.level.values).max())
+        num_hops = max(int(num_hops), 1)
+
+        # --- map absorbing node -> type ---
+        node_to_type_idx = {}      # node_index -> list of positions in type_cells arrays
+        for cell_type, (t_idx, t_ps, t_qs) in type_cells.items():
+            for col, ni in enumerate(t_idx):
+                node_to_type_idx.setdefault(int(ni), []).append((cell_type, col))
+
+        # --- run simulation ---
+        # absorbed_count[cell_type][t, c] = times target t was absorbed at node c of type
+        absorbed_count = {ct: np.zeros((num_targets, len(t_idx)), dtype=np.int64)
+                          for ct, (t_idx, _, _) in type_cells.items()}
+
+        # current[t, r] = current node index for target t, rep r
+        current = np.broadcast_to(target_idx[:, None],
+                                   (num_targets, reps)).copy().astype(np.int64)
+        alive   = np.ones((num_targets, reps), dtype=bool)
+
+        for hop in range(num_hops + 1):
+            # --- absorb walkers that have reached a stopping-point node ---
+            for cell_type, (t_idx, _, _) in type_cells.items():
+                for col, ni in enumerate(t_idx):
+                    at_node = alive & (current == ni)
+                    if at_node.any():
+                        absorbed_count[cell_type][:, col] += at_node.sum(axis=1)
+                        alive[at_node] = False
+
+            if hop == num_hops or not alive.any():
+                break
+
+            # --- advance every still-alive walker one hop ---
+            # Process each target independently to keep memory bounded
+            for t in range(num_targets):
+                alive_t = alive[t]                 # (reps,) bool
+                if not alive_t.any():
+                    continue
+                cur_t = current[t]                 # (reps,) int64
+                walker_pos = cur_t.copy()
+                walker_pos[~alive_t] = -1          # mark dead walkers
+
+                nxt, surv = Paths._csr_sample_step(
+                    indptr, nb_idx, nb_data, rowsum, walker_pos, rng)
+
+                alive[t] &= surv
+                advanced = alive[t]
+                current[t, advanced] = nxt[advanced]
+
+            print_progress(hop + 1, num_hops,
+                           prefix="Matrix-MC synaptic fields:", suffix="Complete")
+
+        # --- build spatial grids ---
+        reps_f = float(reps)
+        fields    = {}
+        all_grid  = np.zeros((num_targets, width, height), dtype=np.float32)
+
+        for cell_type, (t_idx, t_ps, t_qs) in type_cells.items():
+            counts = absorbed_count[cell_type]           # (num_targets, n_type_cells)
+            if not normalize:
+                # raw hit counts — skip all normalization
+                reach = counts.astype(np.float32)
+            elif conditional:
+                denom = counts.sum(axis=1, keepdims=True).astype(float)
+                denom[denom == 0] = 1.0
+                reach = counts / denom
+            else:
+                reach = counts / reps_f                  # (num_targets, n_type_cells)
+            grid   = np.zeros((num_targets, width, height), dtype=np.float32)
+            for col in range(len(t_idx)):
+                grid[:, t_ps[col] - pmin, t_qs[col] - qmin] += reach[:, col]
+            fields[cell_type] = SynapticField(grid, ps=pvals, qs=qvals)
+            all_grid += grid
+
+        fields['all'] = SynapticField(all_grid, ps=pvals, qs=qvals)
+        effects = {key: 1.0 for key in fields}
+        self.synaptic_fields = SynapticFields(fields)
+        self.synaptic_effects = effects
+        return self.synaptic_fields, self.synaptic_effects
+
     def save(self, fn):
         """Save this Paths object to an HDF5 file (using h5py).
 
@@ -2383,8 +2981,12 @@ class SynapticField(np.ndarray):
             indices = np.array(np.meshgrid(np.arange(input_array.shape[1]), np.arange(input_array.shape[2]), indexing='xy'))
             indices = indices.transpose(2, 1, 0)
         obj.indices = indices
-        # load the retinal-to-visual coordinate table
-        obj.visual_info = pd.read_csv("mi1_visual_data.csv")
+        # load the retinal-to-visual coordinate table if it is available (optional; the
+        # attribute is not required to construct or use the field itself)
+        if os.path.exists("mi1_visual_data.csv"):
+            obj.visual_info = pd.read_csv("mi1_visual_data.csv")
+        else:
+            obj.visual_info = None
         return obj
 
     def __array_finalize__(self, obj):
@@ -2393,6 +2995,7 @@ class SynapticField(np.ndarray):
         self.indices = getattr(obj, 'indices', None)
         self.ps = getattr(obj, 'ps', None)
         self.qs = getattr(obj, 'qs', None)
+        self.root_ids = getattr(obj, 'root_ids', None)
 
     def center(self, method='mean', window=(50, 50)):
         """Center the synaptic field based on a specified method.
@@ -2754,6 +3357,8 @@ class SynapticFields(dict):
             save_dict[f"{prefix}indices"] = field.indices
             if hasattr(field, 'centers'):
                 save_dict[f"{prefix}centers"] = field.centers
+            if getattr(field, 'root_ids', None) is not None:
+                save_dict[f"{prefix}root_ids"] = np.asarray(field.root_ids)
         
         # Save pathway names
         save_dict['__pathway_names__'] = np.array(list(self.keys()), dtype=object)
@@ -2829,7 +3434,10 @@ def load_SynapticFields(filename):
         # Restore centers if saved
         if f"{prefix}centers" in data:
             field.centers = data[f"{prefix}centers"]
-        
+        # Restore target root_ids if saved (per-target frame identities)
+        if f"{prefix}root_ids" in data:
+            field.root_ids = data[f"{prefix}root_ids"]
+
         fields[name] = field
     
     return SynapticFields(fields)
@@ -2901,10 +3509,10 @@ def plot_hex_field(field, ps, qs, ax=None, cmap='viridis', scale=1.055, thresh=N
     # add a scaling factor to shrink or expand the hexagons
     radius = scale * 2./3.
     field_normed = (field - vmin) / (vmax - vmin)
-    colors = plt.cm.get_cmap(cmap)(field_normed)
+    colors = plt.get_cmap(cmap)(field_normed)
     if norm is not None:
         # make a normalized colormap using the provided norm and cmap
-        colors = plt.cm.get_cmap(cmap)(norm(field))
+        colors = plt.get_cmap(cmap)(norm(field))
     if thresh is not None:
         included = field > thresh
     else:
