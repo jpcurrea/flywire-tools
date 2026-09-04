@@ -1232,7 +1232,8 @@ def compute_downstream_mc_or_load(connectome, neuron, hops, reps=2000,
 
 def plot_field_grid(all_fields, neurons, channels=None, out_png=None,
                     axis_lim=90, label_size=16, title=None, cmap=None,
-                    row_height=2.2, col_width=2.2, hspace=None, wspace=None):
+                    row_height=2.2, col_width=2.2, hspace=None, wspace=None, 
+                    lognorm=True):
     """Grid of analytic synaptic fields: one row per neuron, one column per channel.
 
     'all' is placed first. The seven input channels share one log color scale (pooled
@@ -1253,8 +1254,12 @@ def plot_field_grid(all_fields, neurons, channels=None, out_png=None,
         input_imgs += [aggregate_image(flds[c]) for c in input_channels if c in flds]
         if "all" in flds:
             all_imgs.append(aggregate_image(flds["all"]))
-    norm_inputs = make_lognorm(input_imgs)
-    norm_all = make_lognorm(all_imgs)
+    if lognorm:
+        norm_inputs = make_lognorm(input_imgs)
+        norm_all = make_lognorm(all_imgs)
+    else:
+        norm_inputs = input_imgs
+        norm_all = all_imgs
     nrows, ncols = len(neurons), len(channels)
     fig, axes = plt.subplots(nrows, ncols, figsize=(col_width * ncols, row_height * nrows),
                              squeeze=False, constrained_layout=True)
@@ -1456,21 +1461,25 @@ def gain_normalized_summary(all_fields, neurons, sens_summary, channels=STARTING
     return pd.DataFrame(rows).T[list(channels)]
 
 
-def combined_scaling_check(all_fields, neurons, channels=STARTING_POINTS):
+def combined_scaling_check(all_fields, neurons, channels=STARTING_POINTS, normalize=True):
     """Assumption check: is each channel's reach field ~ a SCALED copy of the combined `all`?
 
     For each neuron x channel, fits the best scalar a minimizing ||f_ch - a * f_all||
-    (a = <f_ch, f_all> / <f_all, f_all>) on the OR-over-targets fields, and reports:
+    (a = <f_ch, f_all> / <f_all, f_all>) on the pooled-over-targets fields, and reports:
       - resid: ||f_ch - a f_all|| / ||f_ch||   (0 = perfectly a scaled copy; larger = deviates)
       - corr:  Pearson correlation between f_ch and f_all over their union support.
     Low resid / high corr => the combined-field-scaling assumption holds; the exceptions are
     the high-resid, low-corr entries. Returns (resid_df, corr_df).
+
+    ``normalize`` is forwarded to :func:`or_over_targets`: pass ``False`` for raw
+    synapse-count fields (``True`` binarises counts via the probability-OR, which collapses
+    the ``all`` field to a constant and makes every correlation NaN).
     """
     import pandas as pd
     resid_rows, corr_rows = {}, {}
     for neuron in neurons:
         flds = all_fields[neuron]
-        base = or_over_targets(flds["all"]).ravel()
+        base = or_over_targets(flds["all"], normalize=normalize).ravel()
         denom = float(base @ base)
         rr, cr = {}, {}
         for ch in channels:
@@ -1478,7 +1487,7 @@ def combined_scaling_check(all_fields, neurons, channels=STARTING_POINTS):
                 rr[ch] = np.nan
                 cr[ch] = np.nan
                 continue
-            f = or_over_targets(flds[ch]).ravel()
+            f = or_over_targets(flds[ch], normalize=normalize).ravel()
             a = (float(f @ base) / denom) if denom > 0 else 0.0
             res = f - a * base
             rr[ch] = float(np.linalg.norm(res) / (np.linalg.norm(f) + 1e-12))
@@ -1693,8 +1702,14 @@ def plot_dendrogram_with_fields(
     axis_lim=None,
     cmap="magma",
     figsize=None,
+    node_growth=3.0,
 ):
     """Draw a dendrogram with embedded channel hex fields at every leaf and internal node.
+
+    The tree is drawn *horizontally* (root at the right, leaves down the left side) so
+    the neuron names read left-to-right on the left spine.  Internal-node field panels
+    are scaled in proportion to their cosine-distance (merge height) and then shrunk as
+    needed by a greedy resolver so that no two panels overlap.
 
     Leaf panels show the actual OR-over-targets field.  Internal node panels show the
     mean of the leaf fields in that subtree — no SVD back-projection, no z-score
@@ -1727,11 +1742,15 @@ def plot_dendrogram_with_fields(
         Matplotlib colourmap name.
     figsize : tuple or None
         Override figure size; auto-computed if None.
+    node_growth : float
+        Controls how much larger the deepest internal-node panels are than the leaf
+        panels.  A node at the maximum cosine distance is drawn ``(1 + node_growth)``
+        times the leaf-panel size (before non-overlap shrinking).
 
     Returns
     -------
     fig, ax_dend, leaf_axes
-        *leaf_axes* is a list in left-to-right display order.
+        *leaf_axes* is a list in top-to-bottom display order.
     """
     from scipy.spatial.distance import squareform
     from scipy.cluster.hierarchy import linkage as scipy_linkage, dendrogram as scipy_dendrogram
@@ -1803,51 +1822,48 @@ def plot_dendrogram_with_fields(
     leaf_norms = [_per_field_norm(img) for img in leaf_imgs]
 
     # ------------------------------------------------------------------
-    # 6. Figure — dendrogram axes only; leaf panels added after drawing
+    # 6. Figure — horizontal dendrogram (root at right, leaves down the left)
     # ------------------------------------------------------------------
     if figsize is None:
-        fw = n_leaves * leaf_panel + 1.2
-        fh = 9.0
+        fh = n_leaves * leaf_panel + 1.5
+        fw = 14.0
         figsize = (fw, fh)
+    fw, fh = float(figsize[0]), float(figsize[1])
 
-    # Reserve a bottom strip for the leaf panels (square in inches)
-    leaf_panel_in = min(leaf_panel * 0.9, figsize[1] * 0.12)
-    leaf_ph_fig   = leaf_panel_in / figsize[1]
-    gap           = 0.015
+    gap    = 0.008
+    dend_l = 0.19                       # left region reserved for names + leaf panels
+    dend_r = 0.985
+    dend_b = 0.04
+    dend_t = 0.93                       # leave a top strip for the colourbar
 
-    ax_l   = 0.03
-    ax_r   = 0.93          # narrowed to leave room for the colourbar
-    ax_b   = leaf_ph_fig + 2 * gap
-    ax_t   = 0.93
-    cbar_l = ax_r + 0.008
-    cbar_w = 0.012
-    cbar_fh = (ax_t - ax_b) * 0.35   # colourbar = top 35% of dend height
-
-    fig     = plt.figure(figsize=figsize)
-    # Pre-allocate the colourbar axes BEFORE ax_dend so ax_dend's bounding box
-    # is fixed for the lifetime of the figure (no space-stealing later).
-    cbar_ax = fig.add_axes([cbar_l, ax_t - cbar_fh, cbar_w, cbar_fh])
-    ax_dend = fig.add_axes([ax_l, ax_b, ax_r - ax_l, ax_t - ax_b])
+    fig = plt.figure(figsize=figsize)
+    # colourbar strip along the top of the dendrogram body (pre-allocated so
+    # ax_dend's bounding box is fixed for the lifetime of the figure)
+    cbar_ax = fig.add_axes([dend_l, dend_t + 0.02, dend_r - dend_l, 0.012])
+    ax_dend = fig.add_axes([dend_l, dend_b, dend_r - dend_l, dend_t - dend_b])
 
     # ------------------------------------------------------------------
-    # 7. Draw dendrogram (sets xlim/ylim used by coordinate helpers)
+    # 7. Draw dendrogram horizontally (root at right)
     # ------------------------------------------------------------------
     dend = scipy_dendrogram(
         Z,
         ax=ax_dend,
-        labels=None,
+        orientation="right",
+        no_labels=True,
         color_threshold=color_threshold,
         above_threshold_color="#888888",
     )
     # Thicken every dendrogram line
     for line in ax_dend.lines:
         line.set_linewidth(2.0)
-    ax_dend.set_xticks([])
-    ax_dend.set_ylabel("cosine distance", fontsize=14)
-    ax_dend.tick_params(axis='y', labelsize=12, width=1.5, length=5)
-    ax_dend.spines['left'].set_linewidth(1.5)
-    for sp in ["top", "right", "bottom"]:
+    ax_dend.set_yticks([])
+    ax_dend.set_xlabel("cosine distance", fontsize=14)
+    ax_dend.tick_params(axis="x", labelsize=12, width=1.5, length=5)
+    ax_dend.spines["bottom"].set_linewidth(1.5)
+    for sp in ["top", "right", "left"]:
         ax_dend.spines[sp].set_visible(False)
+
+    dist_max = float(Z[:, 2].max()) or 1.0
 
     # ------------------------------------------------------------------
     # 8. Coordinate helpers  (valid after dendrogram sets xlim/ylim)
@@ -1858,29 +1874,31 @@ def plot_dendrogram_with_fields(
         frac = fig.transFigure.inverted().transform(disp)
         return float(frac[0]), float(frac[1])
 
-    def _hspan_fig(x1d, x2d, yd=0.0):
-        """Horizontal data-space span → figure-fraction width."""
-        return abs(_to_fig(x2d, yd)[0] - _to_fig(x1d, yd)[0])
+    # Ensure leaves (distance 0) sit on the LEFT and the root on the right,
+    # regardless of the scipy orientation convention.
+    if _to_fig(0.0, 5.0)[0] > _to_fig(dist_max, 5.0)[0]:
+        ax_dend.invert_xaxis()
 
-    # scipy spaces leaves at x = 5, 15, 25, …  (leaf i at 5 + 10·i)
-    leaf_spacing_fig = _hspan_fig(5.0, 15.0)
-    leaf_pw_fig      = 0.9 * leaf_spacing_fig
-    leaf_ph_fig_sq   = leaf_pw_fig * figsize[0] / figsize[1]  # square in inches
+    # scipy spaces leaves at y = 5, 15, 25, …  (leaf i at 5 + 10·i)
+    leaf_spacing_fig = abs(_to_fig(0.0, 15.0)[1] - _to_fig(0.0, 5.0)[1])
+    leaf_ph_fig = 0.9 * leaf_spacing_fig                 # square in inches
+    leaf_pw_fig = leaf_ph_fig * fh / fw
 
-    # y-strip for leaf panels: flush below the dendrogram axes bottom edge
-    ax_pos       = ax_dend.get_position()
-    leaf_top_fig = ax_pos.y0 - gap
-    leaf_bot_fig = leaf_top_fig - leaf_ph_fig_sq
+    # leaf-panel strip sits just left of the tree (distance-0 edge)
+    x0_fig     = _to_fig(0.0, 5.0)[0]
+    leaf_right = x0_fig - gap
+    leaf_left  = leaf_right - leaf_pw_fig
 
     # ------------------------------------------------------------------
-    # 9. Leaf panels — fig.add_axes at exact leaf x positions
+    # 9. Leaf panels + neuron names on the left spine
     # ------------------------------------------------------------------
     leaf_axes = []
+    placed = []   # (xc, yc, half_w, half_h) fig-fraction boxes for overlap tests
     for i, orig_idx in enumerate(dend["leaves"]):
-        x_data = 5.0 + 10.0 * i
-        xf_c, _ = _to_fig(x_data, 0.0)
-        ax_leaf = fig.add_axes([xf_c - leaf_pw_fig / 2, leaf_bot_fig,
-                                leaf_pw_fig, leaf_ph_fig_sq])
+        y_data = 5.0 + 10.0 * i
+        _, yf_c = _to_fig(0.0, y_data)
+        ax_leaf = fig.add_axes([leaf_left, yf_c - leaf_ph_fig / 2,
+                                leaf_pw_fig, leaf_ph_fig])
         for sp in ax_leaf.spines.values():
             sp.set_visible(False)
         ax_leaf.set_xticks([])
@@ -1888,23 +1906,25 @@ def plot_dendrogram_with_fields(
 
         field2d = type(ref_fld)(leaf_imgs[orig_idx][None], ps=ps_ref, qs=qs_ref)
         draw_field_interp(ax_leaf, field2d, norm=leaf_norms[orig_idx], cmap=cmap, axis_lim=axis_lim)
-        ax_leaf.set_xlabel(neurons[orig_idx], fontsize=9, rotation=90, labelpad=2)
+        ax_leaf.set_ylabel(neurons[orig_idx], fontsize=9, rotation=0,
+                           ha="right", va="center", labelpad=6)
         leaf_axes.append(ax_leaf)
+        placed.append((leaf_left + leaf_pw_fig / 2, yf_c,
+                       leaf_pw_fig / 2, leaf_ph_fig / 2))
 
     # ------------------------------------------------------------------
-    # 10. Internal node panels — fig.add_axes at exact merge coordinates
+    # 10. Internal-node panels — size ∝ cosine distance, non-overlapping
     #
-    # For each U-shape: x_mid = midpoint of the top bar,
-    #                   x_span = width of the top bar (child separation),
-    #                   y_val  = merge height.
-    # Panel width = 0.9 × child separation (auto-scaled; capped at 8× leaf).
+    # Horizontal U-shape: the vertical connector sits at x = merge distance,
+    # spanning y = icoord[1]..icoord[2]; node centre = (distance, y_mid).
+    # Desired panel size grows with distance; a greedy pass (largest first)
+    # shrinks any panel that would overlap an already-placed one.
     # ------------------------------------------------------------------
     height_to_shapes = defaultdict(list)
     for ic, dc in zip(dend["icoord"], dend["dcoord"]):
-        x_mid  = (ic[1] + ic[2]) / 2.0
-        x_span = ic[2] - ic[1]
-        y_val  = float(dc[1])
-        height_to_shapes[y_val].append((x_mid, x_span, y_val))
+        y_mid = (ic[1] + ic[2]) / 2.0
+        dist  = float(dc[1])
+        height_to_shapes[dist].append((y_mid, dist))
     for h in height_to_shapes:
         height_to_shapes[h].sort(key=lambda s: s[0])
 
@@ -1914,12 +1934,14 @@ def plot_dendrogram_with_fields(
     for h in height_to_rows:
         height_to_rows[h].sort()
 
-    node_shapes = {}   # internal_node_id -> (x_mid, x_span, y_val)
+    node_shapes = {}   # internal_node_id -> (y_mid, dist)
     for h, shapes in height_to_shapes.items():
         rows = height_to_rows.get(h, [])
         for shape, row_j in zip(shapes, rows):
             node_shapes[n_leaves + row_j] = shape
 
+    # collect candidates, place biggest (deepest) first so smaller ones yield
+    candidates = []
     for j in range(len(Z)):
         node_id = n_leaves + j
         if node_id not in node_shapes:
@@ -1927,23 +1949,39 @@ def plot_dendrogram_with_fields(
         leaf_idx = _get_node_leaves(Z, n_leaves, node_id)
         if len(leaf_idx) < min_members:
             continue
+        y_mid, dist = node_shapes[node_id]
+        candidates.append((dist, y_mid, node_id, leaf_idx))
+    candidates.sort(key=lambda c: c[0], reverse=True)
 
-        x_mid, x_span, y_node = node_shapes[node_id]
+    for dist, y_mid, node_id, leaf_idx in candidates:
+        frac = dist / dist_max
+        ph = leaf_ph_fig * (1.0 + node_growth * frac)    # desired height ∝ distance
+        pw = ph * fh / fw                                 # square in inches
+        hw, hh = pw / 2.0, ph / 2.0
+
+        xf_c, yf_c = _to_fig(dist, y_mid)
+
+        # greedy shrink so this panel does not overlap any already-placed panel
+        for (pxc, pyc, phw, phh) in placed:
+            dx = abs(xf_c - pxc)
+            dy = abs(yf_c - pyc)
+            if dx < hw + phw and dy < hh + phh:
+                s_x = (dx - phw) / hw if hw > 0 else 0.0
+                s_y = (dy - phh) / hh if hh > 0 else 0.0
+                s = max(0.0, min(1.0, max(s_x, s_y)))
+                hw *= s
+                hh *= s
+        if hw <= 1e-4 or hh <= 1e-4:
+            continue
 
         # Centroid: straight mean of actual channel images — fully interpretable
         centroid_img = np.mean([leaf_imgs[i] for i in leaf_idx], axis=0)
         node_fld = SynapticField(centroid_img[None].astype(np.float32),
                                  ps=ps_ref, qs=qs_ref)
 
-        # All node panels: same size as the leaf panels
-        pw_fig = leaf_pw_fig
-        ph_fig = leaf_ph_fig_sq
-
-        xf_c, yf_c = _to_fig(x_mid, y_node)
-        xf0 = float(np.clip(xf_c - pw_fig / 2, 0.0, 1.0 - pw_fig))
-        yf0 = float(np.clip(yf_c - ph_fig / 2, ax_b, 1.0 - ph_fig))
-
-        ax_node = fig.add_axes([xf0, yf0, pw_fig, ph_fig])
+        xf0 = float(np.clip(xf_c - hw, 0.0, 1.0 - 2 * hw))
+        yf0 = float(np.clip(yf_c - hh, dend_b, dend_t - 2 * hh))
+        ax_node = fig.add_axes([xf0, yf0, 2 * hw, 2 * hh])
         ax_node.patch.set_alpha(0.0)
         for sp in ax_node.spines.values():
             sp.set_visible(False)
@@ -1964,15 +2002,18 @@ def plot_dendrogram_with_fields(
             node_norm = norm
 
         draw_field_interp(ax_node, node_fld, norm=node_norm, cmap=cmap, axis_lim=axis_lim)
+        placed.append((xf_c, yf_c, hw, hh))
 
     # ------------------------------------------------------------------
-    # 11. Shared colourbar  (pre-allocated axes; ax_dend never moves)
+    # 11. Shared colourbar  (horizontal strip along the top)
     # ------------------------------------------------------------------
     sm = ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
-    cbar = fig.colorbar(sm, cax=cbar_ax)
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation="horizontal")
     cbar.set_label(f"{channel} input (a.u.)", fontsize=13)
     cbar.ax.tick_params(labelsize=11)
+    cbar.ax.xaxis.set_label_position("top")
+    cbar.ax.xaxis.set_ticks_position("top")
 
     return fig, ax_dend, leaf_axes
 
@@ -2066,11 +2107,13 @@ def truncated_hosvd(T, ranks):
     return T_hat, factors
 
 
-def build_channel_tensor(all_fields, neurons, channels=None):
+def build_channel_tensor(all_fields, neurons, channels=None, normalize=True):
     """Assemble the global (positions x types x channels) tensor + observed mask.
 
-    For each neuron type and channel the per-clone frames are pooled with the OR combination
-    (``or_over_targets``) into one spatial field, so each type is modelled as a pooling unit.
+    For each neuron type and channel the per-clone frames are pooled with ``or_over_targets``
+    into one spatial field, so each type is modelled as a pooling unit. With ``normalize=True``
+    (default) the pooled value is the OR-over-targets probability; with ``normalize=False`` it
+    is the raw sum over targets (synapse-weighted path counts).
     Positions active in >= 1 (type, channel) form the retinal support (N). An entry is
     OBSERVED where its pooled value > 0 (exactly what plot_field_grid / draw_hex render as
     coloured) and MISSING (to be imputed) where the channel is absent or the pooled reach is
@@ -2093,7 +2136,7 @@ def build_channel_tensor(all_fields, neurons, channels=None):
         flds = all_fields[neuron]
         for kk, ch in enumerate(channels):
             if ch in flds:
-                full[:, j, kk] = or_over_targets(flds[ch]).ravel()
+                full[:, j, kk] = or_over_targets(flds[ch], normalize=normalize).ravel()
     keep = (full > 0).any(axis=(1, 2))              # positions active in >= 1 (type, channel)
     T = full[keep]                                   # (N, M, K)
     observed = T > 0
@@ -2410,12 +2453,14 @@ def svd_select_rank(T, observed, ranks=None, holdout=0.15, seed=0, focus_channel
     return best, table
 
 
-def tensor_to_fields(T, keep, ps, qs, neurons, channels, add_all=True):
+def tensor_to_fields(T, keep, ps, qs, neurons, channels, add_all=True, combine="or"):
     """Rebuild an all_fields-style dict from a (N, M, K) tensor for plotting.
 
     Each (type, channel) becomes a single-frame SynapticField on the full W x H grid
-    (positions outside ``keep`` are 0). If ``add_all`` an OR-combined 'all' channel is added
-    so plot_field_grid works with its default channel list. Returns dict type -> SynapticFields.
+    (positions outside ``keep`` are 0). If ``add_all`` an aggregated 'all' channel is added
+    so plot_field_grid works with its default channel list: ``combine='or'`` (default) uses
+    the probability OR over channels (assumes values in [0, 1]); ``combine='sum'`` adds the
+    channels (for raw synapse-count fields). Returns dict type -> SynapticFields.
     """
     from flywire_tools.connectome import SynapticField, SynapticFields
     width, height = np.asarray(ps).shape[-2:]
@@ -2429,15 +2474,331 @@ def tensor_to_fields(T, keep, ps, qs, neurons, channels, add_all=True):
             flat[keep] = T[:, j, kk]
             img = flat.reshape(width, height)
             fields[ch] = SynapticField(img[None], ps=ps, qs=qs)
-            chan_imgs.append(np.clip(img, 0.0, 1.0))
+            chan_imgs.append(img if combine == "sum" else np.clip(img, 0.0, 1.0))
         if add_all:
-            none_reach = np.ones((width, height), dtype=np.float64)
-            for img in chan_imgs:
-                none_reach *= (1.0 - img)
-            all_img = (1.0 - none_reach).astype(np.float32)
+            if combine == "sum":
+                all_img = np.sum(chan_imgs, axis=0).astype(np.float32)
+            else:
+                none_reach = np.ones((width, height), dtype=np.float64)
+                for img in chan_imgs:
+                    none_reach *= (1.0 - img)
+                all_img = (1.0 - none_reach).astype(np.float32)
             fields["all"] = SynapticField(all_img[None], ps=ps, qs=qs)
         out[neuron] = SynapticFields(fields)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 4b -- 2D-structure-preserving completion (W x H x types x channels)
+# ---------------------------------------------------------------------------
+
+def build_channel_tensor_2d(all_fields, neurons, channels=None, normalize=True):
+    """Assemble the (W x H x types x channels) tensor + observed mask, keeping the 2D grid.
+
+    Unlike :func:`build_channel_tensor` (which collapses the retinal grid to an unordered
+    list of support positions), this keeps the two retinal axes as *separate* tensor modes so
+    a downstream HOSVD can factorise along x and y independently. Geometry is taken from the
+    first requested channel -- the ``'all'`` field is never referenced. Values are pooled over
+    targets with ``or_over_targets`` (probabilities if ``normalize`` else raw counts).
+
+    Returns dict: T (W, H, M, K), observed (bool), support (W, H bool = active in >=1 slice),
+    ps, qs, neurons, channels, shape.
+    """
+    if channels is None:
+        channels = list(STARTING_POINTS)
+    neurons = list(neurons)
+    ref = all_fields[neurons[0]][channels[0]]          # geometry from a real channel, not 'all'
+    width, height = ref.shape[-2:]
+    M, K = len(neurons), len(channels)
+    T = np.zeros((width, height, M, K), dtype=np.float64)
+    for j, neuron in enumerate(neurons):
+        flds = all_fields[neuron]
+        for kk, ch in enumerate(channels):
+            if ch in flds:
+                T[:, :, j, kk] = or_over_targets(flds[ch], normalize=normalize)
+    observed = T > 0
+    support = observed.any(axis=(2, 3))                # (W, H) positions active in >=1 slice
+    return dict(T=T, observed=observed, support=support, ps=ref.ps, qs=ref.qs,
+                neurons=neurons, channels=list(channels), shape=(width, height))
+
+
+def hosvd_impute_2d(T, observed, ranks=None, var_threshold=0.9, max_ranks=None,
+                    n_iter=50, tol=1e-4, clip=None, zscore=True):
+    """HOSVD missing-value imputation that KEEPS the 2D retinal grid (no x-y collapse).
+
+    ``T`` is a (W, H, types, channels) tensor and ``observed`` its bool mask. Because the two
+    spatial axes are separate tensor modes, the low-rank fit factorises along x and y
+    independently -- a separable spatial basis that is far smoother than the unordered-position
+    basis of the collapsed (positions x types x channels) version.
+
+    Each (type, channel) field is z-scored across its OBSERVED spatial positions (so the fit
+    captures shape, not magnitude) when ``zscore``. Missing entries -- including every position
+    outside the field support, which is unobserved in all slices and therefore never
+    influences the fit -- are initialised to the per-field mean, then a hard-EM loop fits a
+    truncated 4-mode HOSVD, overwrites only the missing entries (observed stay exact) and
+    optionally clips, until the missing-update norm drops below ``tol`` or ``n_iter`` is hit.
+    Returns (X_filled, info).
+    """
+    T = np.asarray(T, float)
+    observed = np.asarray(observed, bool)
+    W, H, M, K = T.shape
+    means = np.zeros((M, K))
+    stds = np.ones((M, K))
+    X = np.zeros_like(T)
+    for j in range(M):
+        for kk in range(K):
+            obs = observed[:, :, j, kk]
+            vals = T[:, :, j, kk][obs]
+            mu = float(vals.mean()) if vals.size else 0.0
+            sd = float(vals.std()) if vals.size > 1 else 1.0
+            means[j, kk], stds[j, kk] = mu, (sd if sd > 1e-10 else 1.0)
+            if zscore:
+                X[:, :, j, kk] = np.where(obs, (T[:, :, j, kk] - mu) / stds[j, kk], 0.0)
+            else:
+                X[:, :, j, kk] = np.where(obs, T[:, :, j, kk], mu)
+    miss = ~observed
+    if ranks is None:
+        ranks = _pick_ranks(X, var_threshold, max_ranks=max_ranks)
+    deltas = []
+    for _ in range(n_iter):
+        Xhat, _factors = truncated_hosvd(X, ranks)
+        prev = X[miss]
+        newX = np.where(observed, X, Xhat)             # observed entries stay exact
+        d = float(np.linalg.norm(newX[miss] - prev) / (np.linalg.norm(prev) + 1e-12))
+        deltas.append(d)
+        X = newX
+        if d < tol:
+            break
+    if zscore:
+        X = X * stds[None, None, :, :] + means[None, None, :, :]
+    if clip is not None:
+        X = np.clip(X, clip[0], clip[1])
+    return X, dict(ranks=ranks, n_iter=len(deltas), deltas=deltas)
+
+
+def tensor_to_fields_2d(T, ps, qs, neurons, channels, support=None, add_all=True,
+                        combine="sum"):
+    """Rebuild an all_fields-style dict from a (W, H, types, channels) tensor for plotting.
+
+    ``support`` (W, H bool) masks out-of-field positions back to 0 (their imputed values are
+    discarded). ``combine='sum'`` builds the 'all' channel as the channel sum (raw counts);
+    ``combine='or'`` uses the probability OR. Returns dict type -> SynapticFields.
+    """
+    from flywire_tools.connectome import SynapticField, SynapticFields
+    W, H, M, K = T.shape
+    out = {}
+    for j, neuron in enumerate(neurons):
+        fields, chan_imgs = {}, []
+        for kk, ch in enumerate(channels):
+            img = np.array(T[:, :, j, kk], dtype=np.float32)
+            if support is not None:
+                img = np.where(support, img, 0.0).astype(np.float32)
+            fields[ch] = SynapticField(img[None], ps=ps, qs=qs)
+            chan_imgs.append(img)
+        if add_all:
+            if combine == "sum":
+                all_img = np.sum(chan_imgs, axis=0).astype(np.float32)
+            else:
+                none_reach = np.ones((W, H), dtype=np.float64)
+                for c in chan_imgs:
+                    none_reach *= (1.0 - np.clip(c, 0.0, 1.0))
+                all_img = (1.0 - none_reach).astype(np.float32)
+            fields["all"] = SynapticField(all_img[None], ps=ps, qs=qs)
+        out[neuron] = SynapticFields(fields)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 4c -- L5-anchored reduced-rank regression (channel = linear op of L5)
+# ---------------------------------------------------------------------------
+
+def _support_matrix(all_fields, neurons, channels, normalize=False):
+    """(P support-pixels x M types x K channels) matrix + masks/geometry.
+
+    Missing is defined PER CHANNEL: an entry is observed where the sum over that type's
+    target cells (``or_over_targets(normalize=False)``) is > 0. ``support`` is the full-retina
+    mask (active in >= 1 channel/type); only support pixels are kept as rows.
+    """
+    tens = build_channel_tensor_2d(all_fields, neurons, channels=channels, normalize=normalize)
+    T4, support = tens["T"], tens["support"]
+    W, H, M, K = T4.shape
+    sup_idx = np.flatnonzero(support.ravel())
+    Xp = T4.reshape(W * H, M, K)[sup_idx]
+    obsP = Xp > 0
+    ps = np.asarray(tens["ps"]).ravel()[sup_idx]
+    qs = np.asarray(tens["qs"]).ravel()[sup_idx]
+    return dict(Xp=Xp, obsP=obsP, sup_idx=sup_idx, P=sup_idx.size, shape=(W, H),
+                support=support, ps=ps, qs=qs, ps_grid=tens["ps"], qs_grid=tens["qs"],
+                neurons=list(neurons), channels=list(channels))
+
+
+def build_smooth_basis(ps, qs, n_centers=6, scale=1.5, include_const=True, prune=1e-3):
+    """Smooth 2D Gaussian-RBF basis over the support pixels: (P x r) columns.
+
+    Places an ``n_centers`` x ``n_centers`` grid of RBFs across the (ps, qs) extent, width
+    ``scale`` x grid-spacing. Columns with no nearby support are pruned. A constant column is
+    prepended when ``include_const`` (captures the DC / scaled-copy term).
+    """
+    ps = np.asarray(ps, float); qs = np.asarray(qs, float)
+    cx = np.linspace(ps.min(), ps.max(), n_centers)
+    cy = np.linspace(qs.min(), qs.max(), n_centers)
+    CX, CY = np.meshgrid(cx, cy)
+    centers = np.stack([CX.ravel(), CY.ravel()], axis=1)
+    dx = (ps.max() - ps.min()) / max(n_centers - 1, 1)
+    sigma = max(scale * dx, 1e-6)
+    d2 = (ps[:, None] - centers[None, :, 0]) ** 2 + (qs[:, None] - centers[None, :, 1]) ** 2
+    B = np.exp(-d2 / (2 * sigma ** 2))
+    B = B[:, B.max(axis=0) > prune]
+    if include_const:
+        B = np.hstack([np.ones((B.shape[0], 1)), B])
+    return B
+
+
+def _make_l5_basis(sm, basis="svd", anchor="L5", rank=None, var_threshold=0.95,
+                   n_centers=6, rbf_scale=1.5, log=True):
+    """Build the spatial basis V (P x r) and per-neuron L5 coefficients a (r x M)."""
+    channels = sm["channels"]
+    ci = channels.index(anchor)
+    Xp = sm["Xp"]
+    A = (np.log1p(Xp[:, :, ci]) if log else Xp[:, :, ci]).astype(float)   # (P, M) L5
+    if basis == "svd":
+        U, s, _ = np.linalg.svd(A, full_matrices=False)
+        ev = s ** 2 / max(float(np.sum(s ** 2)), 1e-12)
+        r = int(rank) if rank else int(np.searchsorted(np.cumsum(ev), var_threshold) + 1)
+        r = max(1, min(r, U.shape[1]))
+        V = U[:, :r]
+    elif basis == "spline":
+        V = build_smooth_basis(sm["ps"], sm["qs"], n_centers=n_centers, scale=rbf_scale)
+    else:
+        raise ValueError(f"unknown basis: {basis}")
+    a = np.linalg.pinv(V) @ A                                            # (r, M) L5 in V
+    return V, a, ci
+
+
+def _l5_fit_predict(Xl, obs, ci, V, a, ridge=1e-2):
+    """Fit channel operators C_c and predict every pixel. Xl is (P, M, K) in the fit space.
+
+    For each channel c, solve  min_C  sum_n || (V C a_n - f_{n,c})_obs ||^2 + lam||C||^2
+    (normal equations accumulated per neuron), then predict  V C a  for all neurons.
+    Returns (pred (P, M, K), Cs list).
+    """
+    P, M, K = Xl.shape
+    r = V.shape[1]
+    pred = np.empty_like(Xl)
+    Cs = []
+    for kk in range(K):
+        G = np.zeros((r * r, r * r)); b = np.zeros(r * r)
+        for j in range(M):
+            o = obs[:, j, kk]
+            if not o.any():
+                continue
+            D = (V[o][:, :, None] * a[None, :, j][:, None, :]).reshape(int(o.sum()), r * r)
+            G += D.T @ D
+            b += D.T @ Xl[o, j, kk]
+        lam = ridge * (np.trace(G) / (r * r) + 1e-12)
+        C = (np.linalg.solve(G + lam * np.eye(r * r), b).reshape(r, r)
+             if np.any(b) else np.zeros((r, r)))
+        Cs.append(C)
+        pred[:, :, kk] = V @ C @ a
+    return pred, Cs
+
+
+def l5_anchored_impute(all_fields, neurons, channels=None, anchor="L5", basis="svd",
+                       rank=None, var_threshold=0.95, n_centers=6, rbf_scale=1.5,
+                       ridge=1e-2, log=True, keep_observed=True, combine="sum"):
+    """Impute per-channel missing pixels by regressing every channel on the L5 field.
+
+    Each channel field is modelled as a linear operator applied to the neuron's L5 field in a
+    reduced smooth spatial subspace V (``basis='svd'`` -> leading SVD modes of the L5 fields;
+    ``basis='spline'`` -> fixed Gaussian-RBF surface). The operator is fit across neurons on
+    the observed pixels, so entirely-absent channels are still predicted from that neuron's
+    L5. Observed pixels are kept exact when ``keep_observed``. Returns (imputed_fields, info).
+    """
+    if channels is None:
+        channels = list(STARTING_POINTS)
+    sm = _support_matrix(all_fields, neurons, channels, normalize=False)
+    Xl = (np.log1p(sm["Xp"]) if log else sm["Xp"].astype(float))
+    V, a, ci = _make_l5_basis(sm, basis=basis, anchor=anchor, rank=rank,
+                              var_threshold=var_threshold, n_centers=n_centers,
+                              rbf_scale=rbf_scale, log=log)
+    pred, Cs = _l5_fit_predict(Xl, sm["obsP"], ci, V, a, ridge=ridge)
+    out = pred.copy()
+    if keep_observed:
+        out[sm["obsP"]] = Xl[sm["obsP"]]
+    Ximp = np.clip(np.expm1(out) if log else out, 0.0, None)
+    fields = _scatter_support_to_fields(Ximp, sm, add_all=True, combine=combine)
+    info = dict(basis=basis, r=V.shape[1], ridge=ridge, Cs=Cs, sm=sm)
+    return fields, info
+
+
+def _scatter_support_to_fields(Ximp, sm, add_all=True, combine="sum"):
+    """Rebuild an all_fields-style dict from a (P support-pixels x M x K) matrix."""
+    from flywire_tools.connectome import SynapticField, SynapticFields
+    W, H = sm["shape"]; sup_idx = sm["sup_idx"]
+    ps_grid, qs_grid = sm["ps_grid"], sm["qs_grid"]
+    P, M, K = Ximp.shape
+    out = {}
+    for j, neuron in enumerate(sm["neurons"]):
+        fields, chan_imgs = {}, []
+        for kk, ch in enumerate(sm["channels"]):
+            flat = np.zeros(W * H, dtype=np.float32)
+            flat[sup_idx] = Ximp[:, j, kk]
+            img = flat.reshape(W, H)
+            fields[ch] = SynapticField(img[None], ps=ps_grid, qs=qs_grid)
+            chan_imgs.append(img)
+        if add_all:
+            if combine == "sum":
+                all_img = np.sum(chan_imgs, axis=0).astype(np.float32)
+            else:
+                none_reach = np.ones((W, H), dtype=np.float64)
+                for c in chan_imgs:
+                    none_reach *= (1.0 - np.clip(c, 0.0, 1.0))
+                all_img = (1.0 - none_reach).astype(np.float32)
+            fields["all"] = SynapticField(all_img[None], ps=ps_grid, qs=qs_grid)
+        out[neuron] = SynapticFields(fields)
+    return out
+
+
+def l5_anchored_cv(all_fields, neurons, channels=None, bases=("svd", "spline"), anchor="L5",
+                   holdout=0.2, seed=0, log=True, ridge=1e-2, rank=None, var_threshold=0.95,
+                   n_centers=6, rbf_scale=1.5):
+    """Hold-out comparison of L5-anchored bases: hide observed non-anchor pixels and score.
+
+    L5 (the anchor) is kept fully observed so the basis V and coefficients a are unchanged; a
+    random ``holdout`` fraction of the *other* channels' observed pixels is hidden, the
+    operators are refit on the rest, and recovery of the hidden pixels is scored in raw-count
+    units (RMSE / R2 / Pearson r). Returns a DataFrame, one row per basis.
+    """
+    import pandas as pd
+    if channels is None:
+        channels = list(STARTING_POINTS)
+    sm = _support_matrix(all_fields, neurons, channels, normalize=False)
+    Xl = (np.log1p(sm["Xp"]) if log else sm["Xp"].astype(float))
+    ci = channels.index(anchor)
+    obs = sm["obsP"]
+    cand = np.argwhere(obs)
+    cand = cand[cand[:, 2] != ci]                       # never hide the anchor channel
+    rng = np.random.default_rng(seed)
+    held = cand[rng.choice(len(cand), max(1, int(holdout * len(cand))), replace=False)]
+    hp, hj, hk = held[:, 0], held[:, 1], held[:, 2]
+    obs_tr = obs.copy(); obs_tr[hp, hj, hk] = False
+    truth = np.expm1(Xl[hp, hj, hk]) if log else Xl[hp, hj, hk]
+
+    rows = []
+    for basis in bases:
+        V, a, _ = _make_l5_basis(sm, basis=basis, anchor=anchor, rank=rank,
+                                 var_threshold=var_threshold, n_centers=n_centers,
+                                 rbf_scale=rbf_scale, log=log)
+        pred, _ = _l5_fit_predict(Xl, obs_tr, ci, V, a, ridge=ridge)
+        p = np.clip(np.expm1(pred[hp, hj, hk]) if log else pred[hp, hj, hk], 0.0, None)
+        ss = float(np.sum((truth - truth.mean()) ** 2))
+        r2 = float(1 - np.sum((truth - p) ** 2) / ss) if ss > 0 else np.nan
+        corr = (float(np.corrcoef(truth, p)[0, 1])
+                if truth.std() > 0 and p.std() > 0 else np.nan)
+        rows.append(dict(basis=basis, r=V.shape[1],
+                         rmse=float(np.sqrt(np.mean((p - truth) ** 2))),
+                         r2=r2, corr=corr, n_held=int(len(truth))))
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------

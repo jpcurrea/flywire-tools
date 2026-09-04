@@ -2041,7 +2041,7 @@ class Paths():
         self.pathways_info = pathways_info
         return pathway_set, pathways_info
     
-    def get_synaptic_fields(self, stopping_points=['L1', 'L2', 'L3', 'L4', 'L5', 'R7', 'R8'], side='right', conditional=False, method='simulation', num_hops=None, column_file='column_assignment.csv', normalize=True):
+    def get_synaptic_fields(self, stopping_points=['L1', 'L2', 'L3', 'L4', 'L5', 'R7', 'R8'], side='right', conditional=False, method='simulation', num_hops=None, column_file='column_assignment.csv', normalize=True, by_hop=False):
         """Get all receptive fields for the target.
 
         Note: if you want to subset the pathways or apply specific stopping points,
@@ -2092,11 +2092,14 @@ class Paths():
             The same procedure for a downstream projection will represent the amount of downstream
             mixing, characterized best by the 2D impulse response (akin to a point spread function).
         """
+        if by_hop and method != 'analytic':
+            raise ValueError("by_hop=True is only supported for method='analytic'")
         # dispatch to the analytic backend if requested
         if method == 'analytic':
             return self._get_synaptic_fields_analytic(
                 stopping_points=stopping_points, side=side,
-                conditional=conditional, num_hops=num_hops, normalize=normalize)
+                conditional=conditional, num_hops=num_hops, normalize=normalize,
+                by_hop=by_hop)
         elif method == 'matrix_mc':
             return self._get_synaptic_fields_matrix_mc(
                 stopping_points=stopping_points, side=side,
@@ -2413,8 +2416,53 @@ class Paths():
             P = sp.diags(inv) @ P
         return P.tocsr()
 
+    @staticmethod
+    def _propagate_first_passage(P, absorbing_idx, target_idx, num_hops,
+                                 by_hop=False, progress_prefix=None):
+        """First-passage mass propagation through the transition matrix.
+
+        Starts one unit of mass at each target row and spreads it with ``P`` for
+        ``num_hops`` hops, with the outgoing edges of absorbing nodes zeroed so mass stops on
+        first arrival. Returns ``absorbed`` (num_targets, N): the total mass absorbed at each
+        node.
+
+        When ``by_hop`` is True, also returns ``hop_absorbed`` -- a list of
+        (num_targets, len(absorbing_idx)) arrays, one per hop (0..num_hops), giving the mass
+        that *first* reaches each absorbing node at that hop. Only the absorbing columns are
+        stored per hop (not the full N), so the per-hop record stays small; by construction
+        the entries sum to ``absorbed[:, absorbing_idx]``.
+        """
+        import scipy.sparse as sp
+        N = P.shape[0]
+        absorbing_idx = np.asarray(absorbing_idx)
+        target_idx = np.asarray(target_idx)
+        is_absorbing = np.zeros(N, dtype=bool)
+        is_absorbing[absorbing_idx] = True
+        # zero the outgoing rows of absorbing nodes so mass stops on first arrival
+        P_eff = (sp.diags((~is_absorbing).astype(float)) @ P).tocsr()
+        num_targets = len(target_idx)
+        dist = sp.csr_matrix((np.ones(num_targets), (np.arange(num_targets), target_idx)),
+                             shape=(num_targets, N))
+        absorbed = np.zeros((num_targets, N), dtype=np.float64)
+        hop_absorbed = [] if by_hop else None
+        for hop in range(num_hops):
+            cur = dist[:, absorbing_idx].toarray()
+            absorbed[:, absorbing_idx] += cur
+            if by_hop:
+                hop_absorbed.append(cur)
+            dist = dist @ P_eff
+            if progress_prefix is not None:
+                print_progress(hop + 1, num_hops, prefix=progress_prefix, suffix="Complete")
+        # capture mass that arrives on the final hop
+        final = dist[:, absorbing_idx].toarray()
+        absorbed[:, absorbing_idx] += final
+        if by_hop:
+            hop_absorbed.append(final)
+        return (absorbed, hop_absorbed) if by_hop else absorbed
+
     def _get_synaptic_fields_analytic(self, stopping_points=['L1', 'L2', 'L3', 'L4', 'L5', 'R7', 'R8'],
-                                      side='right', conditional=False, num_hops=None, normalize=True):
+                                      side='right', conditional=False, num_hops=None, normalize=True,
+                                      by_hop=False):
         """Analytic synaptic fields via first-passage propagation of the transition matrix.
 
         Computes the same marginal quantity the simulation estimates by counting -- the
@@ -2441,6 +2489,15 @@ class Paths():
             probabilities. If False, raw synapse weights are used without row-normalization;
             output values represent total synapse-weighted flow to each stopping-point cell,
             preserving differences in absolute connectivity strength across ommatidia.
+        by_hop : bool, default=False
+            If True, additionally build one SynapticFields per hop (the first-passage mass
+            arriving at each hop) and store the list on ``self.synaptic_fields_by_hop``; the
+            per-hop fields sum to the returned total field. With ``normalize=True`` these are
+            per-hop probabilities, with ``normalize=False`` per-hop synapse-weighted path
+            counts -- the quantities needed to image how the path counts / contributions
+            build up hop by hop. Only the absorbing-node columns are kept during propagation,
+            but the assembled per-hop fields still cost ~(num_hops + 1)x the base field
+            storage, so it is opt-in.
 
         Returns
         -------
@@ -2506,39 +2563,49 @@ class Paths():
         absorbing_idx = np.unique(np.concatenate(absorbing_list))
         is_absorbing = np.zeros(N, dtype=bool)
         is_absorbing[absorbing_idx] = True
-        # zero the outgoing rows of absorbing nodes so mass stops on first arrival
-        P_eff = (sp.diags((~is_absorbing).astype(float)) @ P).tocsr()
-        # start one unit of mass at each target and propagate, accumulating absorbed mass
-        dist = sp.csr_matrix((np.ones(num_targets), (np.arange(num_targets), target_idx)),
-                             shape=(num_targets, N))
-        absorbed = np.zeros((num_targets, N), dtype=np.float64)
-        for hop in range(num_hops):
-            absorbed[:, absorbing_idx] += dist[:, absorbing_idx].toarray()
-            dist = dist @ P_eff
-            print_progress(hop + 1, num_hops, prefix="Analytic synaptic fields:", suffix="Complete")
-        # capture mass that arrives on the final hop
-        absorbed[:, absorbing_idx] += dist[:, absorbing_idx].toarray()
+        # propagate first-passage mass (optionally recording each hop's arrivals, kept only
+        # over the absorbing-node columns to bound memory)
+        if by_hop:
+            absorbed, hop_absorbed = self._propagate_first_passage(
+                P, absorbing_idx, target_idx, num_hops, by_hop=True,
+                progress_prefix="Analytic synaptic fields:")
+        else:
+            absorbed = self._propagate_first_passage(
+                P, absorbing_idx, target_idx, num_hops,
+                progress_prefix="Analytic synaptic fields:")
         # optional conditioning on reaching any stopping point
         if conditional:
             denom = absorbed[:, absorbing_idx].sum(axis=1)
             denom[denom == 0] = 1.0
         else:
             denom = np.ones(num_targets)
-        # build a grid per type and the aggregate 'all'
-        fields = {}
-        all_grid = np.zeros((num_targets, width, height), dtype=np.float32)
-        for cell_type, (idx, ps, qs) in type_cells.items():
-            grid = np.zeros((num_targets, width, height), dtype=np.float32)
-            # when normalize=False, denom is already ones and absorbed holds raw
-            # synapse-weighted flow, so no further division is applied here
-            mass = absorbed[:, idx] / denom[:, None]
-            for col in range(len(idx)):
-                grid[:, ps[col] - pmin, qs[col] - qmin] += mass[:, col]
-            fields[cell_type] = SynapticField(grid, ps=pvals, qs=qvals)
-            all_grid += grid
-        fields['all'] = SynapticField(all_grid, ps=pvals, qs=qvals)
-        effects = {key: 1.0 for key in fields.keys()}
-        self.synaptic_fields = SynapticFields(fields)
+
+        # positions of each type's cells within the (sorted) absorbing-node columns, so the
+        # compact per-hop arrays can be scattered with the same code path as the total
+        abs_pos = {ct: np.searchsorted(absorbing_idx, idx)
+                   for ct, (idx, _ps, _qs) in type_cells.items()}
+
+        def _fields_from_absorbing(abs_cols):
+            """Scatter an (num_targets, len(absorbing_idx)) array into per-type fields."""
+            ff = {}
+            all_grid = np.zeros((num_targets, width, height), dtype=np.float32)
+            for cell_type, (idx, ps, qs) in type_cells.items():
+                # when normalize=False, denom is ones and abs_cols holds raw synapse-weighted
+                # flow, so no further division is applied here
+                mass = abs_cols[:, abs_pos[cell_type]] / denom[:, None]
+                grid = np.zeros((num_targets, width, height), dtype=np.float32)
+                for col in range(len(idx)):
+                    grid[:, ps[col] - pmin, qs[col] - qmin] += mass[:, col]
+                ff[cell_type] = SynapticField(grid, ps=pvals, qs=qvals)
+                all_grid += grid
+            ff['all'] = SynapticField(all_grid, ps=pvals, qs=qvals)
+            return SynapticFields(ff)
+
+        self.synaptic_fields = _fields_from_absorbing(absorbed[:, absorbing_idx])
+        effects = {key: 1.0 for key in self.synaptic_fields.keys()}
+        # per-hop fields: first-passage arrivals at each hop (they sum to the total field)
+        self.synaptic_fields_by_hop = (
+            [_fields_from_absorbing(h) for h in hop_absorbed] if by_hop else None)
         self.synaptic_effects = effects
         return self.synaptic_fields, self.synaptic_effects
 
